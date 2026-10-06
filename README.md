@@ -24,6 +24,145 @@ Mọi thành phần trong tài liệu này đã được chạy và kiểm chứ
 | CI/CD | GitHub Actions: lint, test, integration, vuln, docker, Trivy, release, cosign, deploy | Từ commit tới production có kiểm soát |
 | Hạ tầng | Dockerfile distroless non-root, Compose, manifest Kubernetes (HPA, PDB, probes) | Chạy được ngay, đúng chuẩn production |
 
+## Kiến trúc và giao tiếp giữa các service
+
+### Tổng quan hệ thống
+
+Template tách thành hai dịch vụ scale độc lập: `api` xử lý request đồng bộ, `worker` gánh phần bất đồng bộ.
+PostgreSQL là nguồn sự thật duy nhất, Redis đảm nhận các vai trò phụ (cache, rate limit, idempotency, realtime), Kafka là xương sống sự kiện.
+
+```mermaid
+flowchart TB
+    C["Client<br/>(browser, mobile, service khác)"]
+
+    subgraph app["Hai deployment, scale độc lập"]
+        API["api (N pod)<br/>REST + SSE, stateless"]
+        WK["worker (M pod, M <= số partition)<br/>outbox relay + Kafka consumer"]
+    end
+
+    PG[("PostgreSQL<br/>orders, outbox,<br/>processed_events")]
+    RD[("Redis<br/>cache, rate limit,<br/>idempotency, pub/sub")]
+    KF[["Kafka<br/>orders.events và orders.events.dlq"]]
+
+    subgraph obs["Quan sát"]
+        PROM["Prometheus + Grafana"]
+        JAE["Jaeger (OTLP)"]
+    end
+
+    C -->|"POST/GET /v1/orders..."| API
+    API -->|"SSE: snapshot + update"| C
+
+    API -->|"1 transaction: INSERT order + INSERT outbox"| PG
+    API -->|"SELECT sau cache miss"| PG
+    API -->|"cache, rate limit, idempotency"| RD
+    API -->|"PSUBSCRIBE orders:* (1 kết nối mỗi pod)"| RD
+
+    WK -->|"poll outbox theo lô, advisory lock"| PG
+    WK -->|"produce, key = order_id, acks=all"| KF
+    WK -->|"consume theo consumer group"| KF
+    WK -->|"INSERT processed_events (dedup)"| PG
+    WK -->|"PUBLISH channel orders:order_id"| RD
+
+    API -.->|"scrape /metrics"| PROM
+    WK -.->|"scrape /metrics"| PROM
+    API -.->|"traces"| JAE
+    WK -.->|"traces (nối từ traceparent trong outbox)"| JAE
+```
+
+Những điểm chính cần nhớ:
+
+- API không nói chuyện trực tiếp với Kafka.
+- Nó chỉ ghi vào Postgres, sự kiện nằm trong bảng outbox và relay mới publish, nhờ đó không mất event khi process chết giữa chừng.
+- Worker đóng hai vai: relay đưa outbox lên Kafka, và consumer xử lý sự kiện từ Kafka.
+- SSE tới client ở bất kỳ replica nào: worker publish vào Redis pub/sub, mỗi pod api giữ đúng một subscription rồi phân phối cục bộ trong bộ nhớ.
+- Trace liền mạch: `traceparent` được lưu trong outbox, đi qua Kafka header, consumer nối tiếp trace.
+- Kafka chết không làm sập API: sự kiện nằm chờ trong outbox và tự xả khi Kafka hồi phục.
+
+### Luồng ghi: một order đi qua đâu
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as api
+    participant P as PostgreSQL
+    participant W as worker
+    participant K as Kafka
+    participant S as Redis pub/sub
+
+    C->>A: POST /v1/orders (Idempotency-Key)
+    A->>P: BEGIN, INSERT orders + INSERT outbox
+    P-->>A: COMMIT
+    A-->>C: 201 Created, order ở trạng thái PENDING
+
+    Note over W,K: Outbox relay (chạy nền, mỗi 200ms hoặc liên tục khi còn backlog)
+    W->>P: BEGIN, advisory lock, SELECT outbox chưa publish
+    W->>K: produce batch, key = order_id
+    K-->>W: ack từ mọi replica đồng bộ (acks=all)
+    W->>P: UPDATE published_at, COMMIT
+
+    Note over W,S: Consumer (song song theo partition, đúng thứ tự trong partition)
+    W->>K: poll
+    K-->>W: order.created
+    W->>P: BEGIN, INSERT processed_events + xử lý, COMMIT
+    W->>S: PUBLISH lên channel của order
+    S-->>A: đến pod đang giữ kết nối SSE của client
+    A-->>C: SSE event update
+```
+
+Bảo đảm tin cậy của luồng này: at-least-once từ outbox tới Kafka (relay chết sau publish nhưng trước khi đánh dấu thì batch được gửi lại), và exactly-once về hiệu ứng nhờ claim trong `processed_events` cùng transaction với phần xử lý.
+Message lỗi retry hết lần sẽ vào topic DLQ kèm thông tin chẩn đoán, không chặn partition.
+
+### Luồng đọc: cache-aside có bảo vệ
+
+```mermaid
+flowchart LR
+    REQ["GET /v1/orders/{id}"] --> RL["Rate limit<br/>(Redis, fail open)"]
+    RL --> CACHE{"Cache Redis?"}
+    CACHE -->|"hit"| RESP["200 + ETag"]
+    CACHE -->|"miss"| SF["singleflight<br/>gộp request đồng thời cùng id"]
+    SF --> PG[("PostgreSQL")]
+    PG --> SET["SET cache + TTL jitter"]
+    SET --> RESP
+    RESP --> COND{"Client gửi If-None-Match?"}
+    COND -->|"khớp ETag"| N["304, không có body"]
+    COND -->|"không khớp"| B["200, body đầy đủ"]
+```
+
+Redis lỗi ở luồng này chỉ làm chậm hơn (đọc thẳng DB), không làm request thất bại.
+Circuit breaker mở sau vài lỗi liên tiếp để bỏ qua Redis tạm thời.
+
+### Bên trong một service: các lớp Clean Architecture
+
+Quy tắc duy nhất: phụ thuộc chỉ hướng vào trong, và quy tắc này được `depguard` cưỡng chế lúc lint.
+
+```mermaid
+flowchart TB
+    M["cmd (composition root)<br/>tạo adapter, tiêm vào usecase"]
+
+    subgraph adapter["adapter (biết HTTP, SQL, Redis, Kafka)"]
+        H["httpapi"]
+        REP["repository"]
+        RS["redisstore"]
+        MS["messaging"]
+    end
+
+    U["usecase (luồng nghiệp vụ)"]
+    D["domain<br/>entity + port, không import gì bên ngoài"]
+
+    M --> H
+    M --> U
+    M --> D
+    H --> U
+    MS --> U
+    U --> D
+    REP -.->|"hiện thực port"| D
+    RS -.->|"hiện thực port"| D
+    MS -.->|"hiện thực port"| D
+```
+
+Chi tiết từng quyết định, bảng port và adapter, cùng hướng dẫn thêm tính năng mới nằm trong [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Chạy thử trong 3 lệnh
 
 Yêu cầu: Go (xem `go.mod`), Docker.
