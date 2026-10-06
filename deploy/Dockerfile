@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # ---- build stage: compiled once on the build platform, cross compiled per target ----
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 WORKDIR /src
 ENV CGO_ENABLED=0
 # Dependencies first: this layer is cached until go.mod/go.sum change.
