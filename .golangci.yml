@@ -1,0 +1,113 @@
+# golangci-lint v2 configuration. Docs: https://golangci-lint.run/docs/configuration/
+version: "2"
+
+run:
+  timeout: 5m
+  go: "1.26"
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # correctness
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - errorlint        # errors.Is/As instead of == and type assertions
+    - nilerr
+    - forcetypeassert
+    - exhaustive       # switch over enums must handle every value
+    - noctx            # http requests must carry a context
+    - bodyclose
+    - sqlclosecheck
+    - rowserrcheck
+    # security
+    - gosec
+    # style and maintainability
+    - revive
+    - gocritic
+    - misspell
+    - unconvert
+    - unparam
+    - prealloc
+    - perfsprint
+    - nolintlint       # every //nolint must be justified and still needed
+    - thelper
+    - tparallel
+    # architecture: enforce the Clean Architecture dependency rule at lint time
+    - depguard
+  settings:
+    depguard:
+      rules:
+        domain-is-pure:
+          files: ["**/internal/domain/**"]
+          deny:
+            - {pkg: github.com/yourorg/go-clean-template/internal/usecase, desc: "domain must not depend on use cases"}
+            - {pkg: github.com/yourorg/go-clean-template/internal/adapter, desc: "domain must not depend on adapters"}
+            - {pkg: github.com/yourorg/go-clean-template/internal/platform, desc: "domain must not depend on platform"}
+            - {pkg: github.com/jackc/pgx, desc: "domain must not know the database"}
+            - {pkg: github.com/redis/go-redis, desc: "domain must not know Redis"}
+            - {pkg: github.com/twmb/franz-go, desc: "domain must not know Kafka"}
+            - {pkg: github.com/go-chi/chi, desc: "domain must not know HTTP"}
+            - {pkg: net/http, desc: "domain must not know HTTP"}
+        usecase-is-framework-free:
+          files: ["**/internal/usecase/**", "!**/*_test.go"]
+          deny:
+            - {pkg: github.com/yourorg/go-clean-template/internal/adapter, desc: "use cases depend on domain ports, never on adapters"}
+            - {pkg: github.com/yourorg/go-clean-template/internal/platform, desc: "use cases must not depend on platform"}
+            - {pkg: github.com/jackc/pgx, desc: "use cases must not know the database"}
+            - {pkg: github.com/redis/go-redis, desc: "use cases must not know Redis"}
+            - {pkg: github.com/twmb/franz-go, desc: "use cases must not know Kafka"}
+            - {pkg: github.com/go-chi/chi, desc: "use cases must not know HTTP"}
+            - {pkg: net/http, desc: "use cases must not know HTTP"}
+    errcheck:
+      check-type-assertions: true
+    govet:
+      enable-all: true
+      disable: [fieldalignment, shadow]
+    gocritic:
+      enabled-tags: [diagnostic, performance]
+      # Passing config/record structs by value is clearer and these sit on cold paths (startup,
+      # per message handling dominated by IO), so the micro optimisation is noise.
+      disabled-checks: [hugeParam, rangeValCopy]
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+        - name: unused-parameter
+        - name: error-return
+        - name: error-strings
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: time-naming
+        - name: context-as-argument
+        - name: context-keys-type
+    gosec:
+      excludes:
+        - G104 # unhandled errors are covered by errcheck
+  exclusions:
+    generated: lax
+    presets: [comments, std-error-handling, common-false-positives]
+    rules:
+      - path: _test\.go
+        linters: [gosec, errcheck, forcetypeassert, unparam]
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/yourorg/go-clean-template
+  exclusions:
+    generated: lax

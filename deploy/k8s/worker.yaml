@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels: {app: worker}
+spec:
+  # Parallelism is capped by the topic partition count (6 in this template). Scale on consumer
+  # lag with KEDA (kafka scaler) rather than CPU for the best signal; the CPU HPA below is the fallback.
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector:
+    matchLabels: {app: worker}
+  template:
+    metadata:
+      labels: {app: worker}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 60 # let in flight messages finish and offsets commit
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: worker
+          image: ghcr.io/yourorg/go-clean-template-worker
+          ports:
+            - {name: ops, containerPort: 9090}
+          envFrom:
+            - configMapRef: {name: app-config}
+            - secretRef: {name: app-secrets}
+          resources:
+            requests: {cpu: 250m, memory: 192Mi}
+            limits: {cpu: "1", memory: 384Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /readyz, port: ops}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: ops}
+            periodSeconds: 10
+            failureThreshold: 3
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: worker}
+  minReplicas: 2
+  maxReplicas: 6 # == partitions of the orders.events topic
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: {app: worker}

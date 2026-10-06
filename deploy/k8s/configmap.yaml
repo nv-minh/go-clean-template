@@ -1,0 +1,23 @@
+# Non secret configuration. Secrets (DB_URL, REDIS_PASSWORD, KAFKA_SASL_PASSWORD) live in the
+# Secret "app-secrets", provisioned by External Secrets / Sealed Secrets / your vault. Never commit it.
+# See deploy/k8s/secret.example.yaml for the expected keys.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  APP_ENV: production
+  LOG_LEVEL: info
+  REDIS_ADDR: redis-master.cache.svc:6379
+  KAFKA_BROKERS: kafka-0.kafka.svc:9092,kafka-1.kafka.svc:9092,kafka-2.kafka.svc:9092
+  KAFKA_TLS: "true"
+  KAFKA_SASL_MECHANISM: SCRAM-SHA-512
+  OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector.observability.svc:4317
+  OTEL_TRACE_SAMPLE_RATIO: "0.05"
+  # Total DB connections = replicas * DB_MAX_CONNS must stay below Postgres max_connections.
+  DB_MAX_CONNS: "20"
+  DB_MIN_CONNS: "4"
+  HTTP_SHUTDOWN_DELAY: "5s"
+  HTTP_TRUST_PROXY_HEADERS: "true" # the ingress controller sets X-Forwarded-For
+  RATE_LIMIT_RPS: "50"
+  RATE_LIMIT_BURST: "100"

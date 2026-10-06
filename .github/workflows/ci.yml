@@ -1,0 +1,111 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push cancels the in-progress run of the same branch/PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # single source of truth for the Go version
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.14.0 # keep in sync with GOLANGCI_LINT_VERSION in the Makefile
+
+  generated-code:
+    name: generated code and go.mod are up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make sqlc
+      - run: go mod tidy
+      - name: Fail if anything changed
+        run: git diff --exit-code -- go.mod go.sum internal/adapter/repository/sqlcdb
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Unit tests (race detector)
+        run: go test -race -count=1 -coverprofile=coverage.out ./...
+      - name: Coverage gate
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%","",$3); print $3}')
+          echo "total coverage: ${total}%"
+          awk -v t="$total" -v min="${COVERAGE_MIN}" 'BEGIN { exit (t+0 < min+0) }' \
+            || { echo "coverage ${total}% is below the ${COVERAGE_MIN}% gate"; exit 1; }
+        env:
+          COVERAGE_MIN: "60"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  integration:
+    runs-on: ubuntu-latest # Docker is available, testcontainers starts Postgres, Redis and Kafka
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 -tags=integration -timeout=15m ./internal/integration/...
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make vuln
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [api, worker, migrate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (not pushed on CI)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: ${{ matrix.target }}
+          load: true
+          tags: ${{ matrix.target }}:ci
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ matrix.target }}:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

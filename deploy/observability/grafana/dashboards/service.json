@@ -1,0 +1,39 @@
+{
+  "uid": "go-clean-template",
+  "title": "Go Clean Template - service overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": {"from": "now-30m", "to": "now"},
+  "panels": [
+    {"id": 1, "type": "timeseries", "title": "Requests per second by route", "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+     "targets": [{"expr": "sum by (route) (rate(app_http_requests_total[1m]))", "legendFormat": "{{route}}"}]},
+    {"id": 2, "type": "timeseries", "title": "5xx error ratio", "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+     "fieldConfig": {"defaults": {"unit": "percentunit"}},
+     "targets": [{"expr": "sum(rate(app_http_requests_total{status=~\"5..\"}[1m])) / sum(rate(app_http_requests_total[1m]))", "legendFormat": "5xx"}]},
+    {"id": 3, "type": "timeseries", "title": "Latency p50 / p95 / p99", "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+     "fieldConfig": {"defaults": {"unit": "s"}},
+     "targets": [
+       {"expr": "histogram_quantile(0.50, sum by (le) (rate(app_http_request_duration_seconds_bucket[1m])))", "legendFormat": "p50"},
+       {"expr": "histogram_quantile(0.95, sum by (le) (rate(app_http_request_duration_seconds_bucket[1m])))", "legendFormat": "p95"},
+       {"expr": "histogram_quantile(0.99, sum by (le) (rate(app_http_request_duration_seconds_bucket[1m])))", "legendFormat": "p99"}]},
+    {"id": 4, "type": "timeseries", "title": "In flight requests", "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+     "targets": [{"expr": "sum(app_http_in_flight_requests)", "legendFormat": "in flight"}]},
+    {"id": 5, "type": "timeseries", "title": "DB pool: acquired vs max (saturation)", "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+     "targets": [
+       {"expr": "sum(app_db_pool_acquired_conns)", "legendFormat": "acquired"},
+       {"expr": "sum(app_db_pool_max_conns)", "legendFormat": "max"},
+       {"expr": "rate(app_db_pool_acquire_wait_seconds_total[1m])", "legendFormat": "wait s/s {{instance}}"}]},
+    {"id": 6, "type": "timeseries", "title": "Cache hit ratio", "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+     "fieldConfig": {"defaults": {"unit": "percentunit"}},
+     "targets": [{"expr": "sum(rate(app_cache_operations_total{result=\"hit\"}[1m])) / sum(rate(app_cache_operations_total{result=~\"hit|miss\"}[1m]))", "legendFormat": "hit ratio"}]},
+    {"id": 7, "type": "timeseries", "title": "Outbox published per second", "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+     "targets": [{"expr": "sum(rate(app_outbox_published_total[1m]))", "legendFormat": "events/s"}]},
+    {"id": 8, "type": "timeseries", "title": "Consumer messages by result (dlq must stay at 0)", "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+     "targets": [{"expr": "sum by (result) (rate(app_consumer_messages_total[1m]))", "legendFormat": "{{result}}"}]},
+    {"id": 9, "type": "timeseries", "title": "Go runtime: goroutines and heap", "gridPos": {"x": 0, "y": 32, "w": 24, "h": 8},
+     "targets": [
+       {"expr": "sum by (job) (go_goroutines)", "legendFormat": "goroutines {{job}}"},
+       {"expr": "sum by (job) (go_memstats_heap_inuse_bytes)", "legendFormat": "heap bytes {{job}}"}]}
+  ]
+}
