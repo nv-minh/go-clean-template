@@ -1,0 +1,27 @@
+# Run BEFORE rolling out a new version (CI step, Argo CD PreSync hook, or Helm pre-upgrade hook):
+#   kubectl apply -f deploy/k8s/migrate-job.yaml && kubectl wait --for=condition=complete job/migrate --timeout=300s
+# Migrations must be backwards compatible with the version still running (expand, then contract).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  namespace: orders
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: migrate
+          image: ghcr.io/yourorg/go-clean-template-migrate:latest
+          args: ["up"]
+          envFrom:
+            - secretRef: {name: app-secrets}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}

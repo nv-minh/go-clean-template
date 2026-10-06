@@ -1,0 +1,64 @@
+# Prometheus alert rules. Every alert links to a section of docs/RUNBOOK.md.
+# Thresholds are starting points: tune them against your SLOs after the first load test.
+groups:
+  - name: api
+    rules:
+      - alert: ApiHighErrorRate
+        expr: sum(rate(app_http_requests_total{status=~"5.."}[5m])) / sum(rate(app_http_requests_total[5m])) > 0.01
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "More than 1% of API requests fail with 5xx"
+          runbook: "docs/RUNBOOK.md#high-5xx-rate"
+      - alert: ApiHighLatencyP99
+        expr: histogram_quantile(0.99, sum by (le) (rate(app_http_request_duration_seconds_bucket[5m]))) > 1
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "API p99 latency above 1s"
+          runbook: "docs/RUNBOOK.md#high-latency"
+      - alert: DbPoolSaturated
+        expr: sum(app_db_pool_acquired_conns) / sum(app_db_pool_max_conns) > 0.9
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "PostgreSQL connection pool above 90% utilisation"
+          runbook: "docs/RUNBOOK.md#database-pool-saturation"
+  - name: async
+    rules:
+      - alert: DeadLetterQueueReceivingMessages
+        expr: increase(app_consumer_messages_total{result="dlq"}[10m]) > 0
+        labels: {severity: ticket}
+        annotations:
+          summary: "Messages are being dead lettered"
+          runbook: "docs/RUNBOOK.md#dead-letter-queue-not-empty"
+      - alert: OutboxNotDraining
+        # Events are written but nothing is published: relay down, Kafka unreachable or lock stuck.
+        expr: sum(rate(app_http_requests_total{method="POST",status="201"}[5m])) > 0 and sum(rate(app_outbox_published_total[5m])) == 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Orders are created but the outbox relay publishes nothing"
+          runbook: "docs/RUNBOOK.md#outbox-backlog-growing"
+      - alert: ConsumerNotProcessing
+        expr: sum(rate(app_outbox_published_total[5m])) > 0 and sum(rate(app_consumer_messages_total{result="ok"}[5m])) == 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "Events are published but the consumer processes nothing"
+          runbook: "docs/RUNBOOK.md#consumer-lag-growing"
+  - name: platform
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $labels.job }} instance {{ $labels.instance }} is down"
+      - alert: GoroutineLeakSuspected
+        expr: go_goroutines > 10000
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "More than 10k goroutines on {{ $labels.instance }}"
+          runbook: "docs/RUNBOOK.md#memory-or-goroutine-growth"

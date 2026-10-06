@@ -1,0 +1,138 @@
+# Local development stack.
+#   make infra-up   -> only backing services (run api/worker with `go run` for fast iteration)
+#   make up         -> everything, including migrate + api + worker containers (profile "app")
+name: go-clean-template
+
+x-app-env: &app-env
+  APP_ENV: local
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DB_URL: postgres://app:app@postgres:5432/app?sslmode=disable
+  REDIS_ADDR: redis:6379
+  KAFKA_BROKERS: kafka:19092
+  OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
+  OTEL_TRACE_SAMPLE_RATIO: "1"
+  RATE_LIMIT_RPS: "1000"
+  RATE_LIMIT_BURST: "2000"
+  OPS_PPROF_ADDR: ""
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB", "-c", "log_min_duration_statement=250"]
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--appendonly", "no"]
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Single node KRaft broker (no ZooKeeper). Two listeners: kafka:19092 for containers and
+  # localhost:9092 for processes running on the host.
+  kafka:
+    image: apache/kafka:3.9.0
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:19092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  # Topics are explicit infrastructure, never auto created in production. 6 partitions allows up to
+  # 6 parallel worker replicas for this consumer group.
+  kafka-init:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic orders.events --partitions 6 --replication-factor 1 --config retention.ms=604800000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic orders.events.dlq --partitions 1 --replication-factor 1 --config retention.ms=2592000000
+    restart: "no"
+
+  migrate:
+    profiles: [app]
+    build: {context: .., dockerfile: deploy/Dockerfile, target: migrate}
+    environment: {DB_URL: "postgres://app:app@postgres:5432/app?sslmode=disable"}
+    command: ["up"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    profiles: [app]
+    build: {context: .., dockerfile: deploy/Dockerfile, target: api}
+    environment: *app-env
+    ports: ["8080:8080", "9090:9090"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      kafka-init: {condition: service_completed_successfully}
+    stop_grace_period: 40s
+
+  worker:
+    profiles: [app]
+    build: {context: .., dockerfile: deploy/Dockerfile, target: worker}
+    environment: *app-env
+    ports: ["9091:9090"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      kafka-init: {condition: service_completed_successfully}
+    stop_grace_period: 40s
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9099:9090"]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./observability/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./observability/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.65.0
+    environment: {COLLECTOR_OTLP_ENABLED: "true"}
+    ports: ["16686:16686", "4317:4317"]
+
+volumes:
+  pgdata:

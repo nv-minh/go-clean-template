@@ -1,0 +1,93 @@
+name: release
+
+# Tag vX.Y.Z -> build, push, sign and deploy.   git tag v1.2.3 && git push --tags
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # keyless signing with cosign
+    strategy:
+      matrix:
+        target: [api, worker, migrate]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: sigstore/cosign-installer@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-${{ matrix.target }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ github.ref_name }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+      - name: Sign the image digest
+        run: cosign sign --yes ghcr.io/${{ github.repository }}-${{ matrix.target }}@${{ steps.build.outputs.digest }}
+
+  # Deployment is a template: it only runs when the repository variable DEPLOY_ENABLED is "true"
+  # and a cluster credential exists. Configure required reviewers on each GitHub Environment so
+  # production needs a manual approval.
+  deploy-staging:
+    needs: images
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          echo "$KUBECONFIG_B64" | base64 -d > "$RUNNER_TEMP/kubeconfig"
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          version="${TAG#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY}"
+          # 1) migrations first (backwards compatible), 2) roll out the new version.
+          sed "s#ghcr.io/yourorg/go-clean-template-migrate:latest#${image}-migrate:${version}#" deploy/k8s/migrate-job.yaml | kubectl apply -f -
+          kubectl -n orders wait --for=condition=complete job/migrate --timeout=300s
+          (cd deploy/k8s && kustomize edit set image \
+            "ghcr.io/yourorg/go-clean-template-api=${image}-api:${version}" \
+            "ghcr.io/yourorg/go-clean-template-worker=${image}-worker:${version}")
+          kubectl apply -k deploy/k8s
+          kubectl -n orders rollout status deploy/api --timeout=300s
+          kubectl -n orders rollout status deploy/worker --timeout=300s
+
+  deploy-production:
+    needs: deploy-staging
+    if: vars.DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: production # configure "required reviewers" here for manual approval
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Repeat the staging deploy steps with the production cluster credentials."
