@@ -19,7 +19,7 @@ jobs:
       matrix:
         target: [api, worker, migrate]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: sigstore/cosign-installer@v3
@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: staging
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Deploy
         env:
           KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
@@ -89,5 +89,5 @@ jobs:
     runs-on: ubuntu-latest
     environment: production # configure "required reviewers" here for manual approval
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: echo "Repeat the staging deploy steps with the production cluster credentials."
